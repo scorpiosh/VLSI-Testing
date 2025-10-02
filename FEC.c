@@ -60,7 +60,8 @@ typedef struct {
     size_t n;   /* size */
 } DSU;
 
-static void dsu_init(DSU *d, size_t n){ d->n=n; d->p=(int*)malloc(n*sizeof(int)); d->r=(int*)calloc(n,sizeof(int));
+static void dsu_init(DSU *d, size_t n){
+    d->n=n; d->p=(int*)malloc(n*sizeof(int)); d->r=(int*)calloc(n,sizeof(int));
     if(!d->p||!d->r) die("oom");
     for(size_t i=0;i<n;++i) d->p[i]=(int)i;
 }
@@ -75,14 +76,13 @@ static void dsu_union(DSU *d,int a,int b){
 /* helper: index for (node, sa) */
 static inline int fault_idx(long node, int sa){ return (int)(2*(node-1) + (sa?1:0)); }
 
-/* ---------- Main ---------- */
 int main(int argc, char **argv){
     if(argc<2){
-        fprintf(stderr,"Usage: %s <netlist.txt> [--list-classes]\n", argv[0]);
+        fprintf(stderr,"Usage: %s <netlist.txt> [--csv]\n", argv[0]);
         return 1;
     }
     const char *path=argv[1];
-    int list_classes = (argc>=3 && strcmp(argv[2],"--list-classes")==0);
+    int as_csv = (argc>=3 && strcmp(argv[2],"--csv")==0);
 
     FILE *fp=fopen(path,"r"); if(!fp) die("cannot open netlist");
 
@@ -123,60 +123,44 @@ int main(int argc, char **argv){
             gates[ng++] = (Gate){gt,o,i1,i2};
             continue;
         }
-
-        /* ignore unknown trailing labels */
     }
     fclose(fp);
 
-    /* Build DSU over existing faults (compact by using max id) */
     long max_id = (long)nodes.cap - 1;
     long line_count=0;
     for(long i=1;i<=max_id;++i) if(nodes.bits[i]) ++line_count;
     long initial_faults = line_count * 2;
 
-    /* We allocate DSU for indices up to max_id even if some ids unused (simple) */
     size_t dsu_size = (size_t) (2 * (max_id>0?max_id:1));
     DSU dsu; dsu_init(&dsu, dsu_size);
 
     /* ---------- Equivalence rules ---------- */
-
     for(size_t k=0;k<ng;++k){
         Gate g = gates[k];
-
-        /* 1) Symmetry-based input equivalence */
+        /* Symmetry */
         if(g.t==G_AND || g.t==G_NAND){
-            /* sa0_in1 == sa0_in2 */
             if(g.in1>0 && g.in2>0){
-                dsu_union(&dsu, fault_idx(g.in1,0), fault_idx(g.in2,0));
+                dsu_union(&dsu, fault_idx(g.in1,0), fault_idx(g.in2,0)); /* sa0 inputs eq */
             }
         } else if(g.t==G_OR || g.t==G_NOR){
-            /* sa1_in1 == sa1_in2 */
             if(g.in1>0 && g.in2>0){
-                dsu_union(&dsu, fault_idx(g.in1,1), fault_idx(g.in2,1));
+                dsu_union(&dsu, fault_idx(g.in1,1), fault_idx(g.in2,1)); /* sa1 inputs eq */
             }
         }
-
-        /* 2) Inverter detection (NAND a,a -> NOT) */
+        /* NAND inverter (a,a) */
         if(g.t==G_NAND && g.in1==g.in2 && g.in1>0){
             long a=g.in1, o=g.out;
-            /* input sa0 <-> output sa1 ; input sa1 <-> output sa0 */
             dsu_union(&dsu, fault_idx(a,0), fault_idx(o,1));
             dsu_union(&dsu, fault_idx(a,1), fault_idx(o,0));
         }
-
-        /* (Optional) NOR a,a -> NOT: uncomment if present in your netlists
-        if(g.t==G_NOR && g.in1==g.in2 && g.in1>0){
-            long a=g.in1, o=g.out;
-            dsu_union(&dsu, fault_idx(a,0), fault_idx(o,0)); // since NOR(a,a)=~a, check mapping carefully
-            dsu_union(&dsu, fault_idx(a,1), fault_idx(o,1));
-        }
-        */
+        /* (Optional) NOR inverter (a,a) mapping could be added if needed */
     }
 
-    /* ---------- Emit representatives ---------- */
-    /* We keep exactly one fault per equivalence class among existing nodes. */
-    int *mark = (int*)calloc(dsu_size, sizeof(int));
-    if(!mark) die("oom");
+    /* Build representative per class: rep_idx[root] = the first idx encountered in that class */
+    int *rep_idx = (int*)malloc(dsu_size*sizeof(int));
+    int *seen_root = (int*)calloc(dsu_size,sizeof(int));
+    if(!rep_idx||!seen_root) die("oom");
+    for(size_t i=0;i<dsu_size;++i) rep_idx[i] = -1;
 
     long kept=0;
     for(long id=1; id<=max_id; ++id){
@@ -184,54 +168,48 @@ int main(int argc, char **argv){
         for(int sa=0; sa<=1; ++sa){
             int idx = fault_idx(id, sa);
             int root = dsu_find(&dsu, idx);
-            if(!mark[root]) { mark[root]=1; kept++; }
+            if(!seen_root[root]){
+                seen_root[root]=1;
+                rep_idx[root]=idx;
+                kept++;
+            }
         }
     }
 
-    /* Print summary */
     printf("Initial faults: %ld\n", initial_faults);
     printf("Collapsed (equivalence) faults: %ld\n", kept);
     if(kept>0) printf("Collapse ratio: %.2f\n", (double)initial_faults / (double)kept);
-    printf("----\nKept representatives:\n");
+    printf("----\n");
 
-    /* Print one representative name per class */
-    /* Choose the smallest (id,sa) in the class as representative when we encounter it first */
-    memset(mark,0,dsu_size*sizeof(int));
+    /* --------- MATRIX OUTPUT ---------
+       For each node id present, print:
+       node  keep_sa0  keep_sa1
+       keep=1 if that (node,sa) is the chosen representative of its class; else 0
+    */
+    if(as_csv){
+        printf("node,keep_sa0,keep_sa1\n");
+    } else {
+        printf("%-6s %-8s %-8s\n","node","keep_sa0","keep_sa1");
+    }
+
     for(long id=1; id<=max_id; ++id){
         if(!nodes.bits[id]) continue;
-        for(int sa=0; sa<=1; ++sa){
-            int idx = fault_idx(id, sa);
-            int root = dsu_find(&dsu, idx);
-            if(!mark[root]){
-                mark[root]=1;
-                printf("%s_%ld\n", sa? "sa1":"sa0", id);
-            }
+        int idx0 = fault_idx(id,0);
+        int idx1 = fault_idx(id,1);
+        int r0 = dsu_find(&dsu, idx0);
+        int r1 = dsu_find(&dsu, idx1);
+        int k0 = (rep_idx[r0] == idx0) ? 1 : 0;
+        int k1 = (rep_idx[r1] == idx1) ? 1 : 0;
+
+        if(as_csv){
+            printf("%ld,%d,%d\n", id, k0, k1);
+        } else {
+            printf("%-6ld %-8d %-8d\n", id, k0, k1);
         }
     }
 
-    /* Optional: list full classes
-    if(list_classes){
-        printf("----\nClasses:\n");
-        for(size_t r=0;r<dsu_size;++r){
-            if(dsu_find(&dsu,(int)r)!= (int)r) continue; 
-            int printed=0;
-            for(long id=1; id<=max_id; ++id){
-                if(!nodes.bits[id]) continue;
-                for(int sa=0; sa<=1; ++sa){
-                    int idx=fault_idx(id,sa);
-                    if(dsu_find(&dsu,idx)==(int)r){
-                        if(!printed){ printf("{ "); printed=1; }
-                        printf("%s_%ld ", sa?"sa1":"sa0", id);
-                    }
-                }
-            }
-            if(printed) printf("}\n");
-        }
-    }
-    */
-
-    /* cleanup */
-    free(mark);
+    free(rep_idx);
+    free(seen_root);
     free(dsu.p); free(dsu.r);
     free(gates);
     free(nodes.bits);
